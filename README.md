@@ -1,6 +1,6 @@
 # Jasman Mander
 
-First-year Financial Mathematics and BBA double degree student at Wilfrid Laurier University, building at the intersection of quantitative finance and applied AI.
+Second-year Financial Mathematics and BBA double degree student at Wilfrid Laurier University, building at the intersection of quantitative finance and applied AI.
 
 ## Projects
 
