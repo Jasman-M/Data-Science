@@ -1,0 +1,1037 @@
+<script>
+/* ============================================================
+   ARIA Insurance Copilot
+   Synthetic demo data + runtime. Nothing here is a real person,
+   a real business, or a real underwriting file.
+   ============================================================ */
+
+const LOB_LABELS = {
+  life_health: 'Life & Health',
+  home_property: 'Home & Property',
+  commercial_business: 'Commercial & Business'
+};
+
+const TIER_LABELS = {
+  1: 'Preferred / Standard Plus',
+  2: 'Standard',
+  3: 'Substandard / Rated',
+  4: 'Decline'
+};
+
+const STATUS_LABELS = {
+  assessed: 'Assessed',
+  insufficient_info: 'Needs more information',
+  refer_siu: 'SIU referral',
+  refer_specialist: 'Specialist market'
+};
+
+
+/* ---------- constants ---------- */
+const SYSTEM_PROMPT = document.getElementById('ariaSystemPrompt').textContent.trim();
+const ADDENDUM = document.getElementById('ariaAddendum').textContent.trim();
+const DISCLAIMER_LINE = 'Advisory only, not a binding decision. Synthetic data for testing.';
+const OPENER = "Paste an applicant profile and pick a line of business to begin.";
+
+const LS_SESSION = 'aria.copilot.v1.session';
+const LS_SETTINGS = 'aria.copilot.v1.settings';
+const KEY_STORE = 'aria.copilot.v1.key';
+const MAX_INPUT_BYTES = 60000;
+
+const ERR_COPY = {
+  not_granted: 'This page needs your permission to use Claude. Reload and choose Allow.',
+  sampling_disabled: 'Claude is not available on this account.',
+  not_declared: 'Claude is not available in this view.',
+  capability_disabled: 'Claude is not available in this view.',
+  capability_removed: 'This viewer cannot run ARIA. Open the standalone build instead.',
+  rate_limited: 'Too many requests right now. Wait a moment, then send again.',
+  session_expired: 'Your Claude session expired. Sign in again, then reload this page.',
+  refused: 'ARIA stopped before answering that one. Rephrase it and try again.',
+  empty_completion: 'ARIA returned an empty reply. Ask for less at once.',
+  prompt_too_large: 'This session is too long for one request. Start a new session or shorten the profile.',
+  invalid_request: 'The request was malformed. Start a new session if this repeats.',
+  transform_error: 'The request could not be prepared. Start a new session if this repeats.',
+  auth: 'The API key was rejected. Check it under How it works.',
+  model: 'That model ID was not found. Check it under How it works.',
+  network: 'Could not reach the Anthropic API from this browser.',
+  cancelled: 'Stopped.',
+  upstream_error: 'The connection dropped before ARIA finished. Send again to retry.'
+};
+const FATAL_CODES = new Set(['not_granted', 'sampling_disabled', 'not_declared', 'capability_disabled', 'capability_removed']);
+
+/* ---------- helpers ---------- */
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const byteLen = (s) => enc.encode(s).length;
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const clip = (s, n) => { s = String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+const uid = () => Math.random().toString(36).slice(2, 9);
+const clockOf = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+function renderMarkdown(src) {
+  const lib = window.marked;
+  const parse = lib && (lib.parse || (lib.marked && lib.marked.parse));
+  if (!parse || !window.DOMPurify) return '<p>' + esc(src).replace(/\n{2,}/g, '</p><p>').replace(/\n/g, '<br>') + '</p>';
+  try {
+    const html = parse(String(src), { gfm: true, breaks: false });
+    return window.DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  } catch (e) {
+    return '<p>' + esc(src).replace(/\n/g, '<br>') + '</p>';
+  }
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const root = $('toastRoot');
+  root.innerHTML = '<div class="toast">' + esc(msg) + '</div>';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { root.innerHTML = ''; }, 3200);
+}
+
+/* ---------- state ---------- */
+const state = {
+  lob: 'life_health',
+  turns: [],
+  sheets: [],
+  activeSheet: null,
+  checks: {},
+  depth: 'default',
+  view: 'thread',
+  busy: false,
+  mode: 'init',
+  api: { key: '', model: 'claude-sonnet-5', remember: false },
+  guardAck: false,
+  fatal: null
+};
+
+let sampleFn = null;
+let downloadsNs = null;
+let readyP = null;
+let controller = null;
+let liveNode = null;
+let stick = true;
+
+function saveSession() {
+  try {
+    localStorage.setItem(LS_SESSION, JSON.stringify({
+      lob: state.lob, turns: state.turns, sheets: state.sheets,
+      activeSheet: state.activeSheet, checks: state.checks
+    }));
+  } catch (e) { /* storage may be unavailable */ }
+}
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(LS_SESSION);
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    if (!d || typeof d !== 'object') return;
+    state.lob = typeof d.lob === 'string' && d.lob ? d.lob : 'life_health';
+    state.turns = Array.isArray(d.turns) ? d.turns : [];
+    state.sheets = Array.isArray(d.sheets) ? d.sheets : [];
+    state.activeSheet = d.activeSheet || null;
+    state.checks = d.checks && typeof d.checks === 'object' ? d.checks : {};
+  } catch (e) { /* ignore corrupt state */ }
+}
+function saveSettings() {
+  try { localStorage.setItem(LS_SETTINGS, JSON.stringify({ depth: state.depth, model: state.api.model, remember: state.api.remember })); } catch (e) {}
+}
+function loadSettings() {
+  try {
+    const d = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
+    if (d.depth === 'complex' || d.depth === 'default' || d.depth === 'quick') state.depth = d.depth;
+    if (typeof d.model === 'string' && d.model.trim()) state.api.model = d.model.trim();
+    state.api.remember = !!d.remember;
+  } catch (e) {}
+  try { state.api.key = (state.api.remember ? localStorage.getItem(KEY_STORE) : sessionStorage.getItem(KEY_STORE)) || ''; } catch (e) {}
+}
+function storeKey(k) {
+  state.api.key = k;
+  try {
+    if (state.api.remember) { localStorage.setItem(KEY_STORE, k); sessionStorage.removeItem(KEY_STORE); }
+    else { sessionStorage.setItem(KEY_STORE, k); localStorage.removeItem(KEY_STORE); }
+  } catch (e) {}
+}
+
+/* ---------- prompt assembly ---------- */
+function instructionTurn() {
+  const today = new Date().toISOString().slice(0, 10);
+  return [
+    'You are being run inside the ARIA Insurance Copilot web interface. Everything between the markers below is your configuration for this entire conversation. Follow it exactly and stay in the ARIA role in every reply.',
+    '=== BEGIN ARIA CONFIGURATION ===',
+    SYSTEM_PROMPT,
+    '',
+    '---',
+    '',
+    ADDENDUM,
+    '=== END ARIA CONFIGURATION ===',
+    'Session date: ' + today + '. Every message after this one comes from the interface user.'
+  ].join('\n\n');
+}
+function wrapUser(text, lob) {
+  const safe = String(text).replace(/<\/?app_user_message>/gi, '[tag removed]');
+  const tag = lob ? '[Line of business: ' + LOB_LABELS[lob] + ']\n\n' : '';
+  return '<app_user_message>\n' + tag + safe + '\n</app_user_message>';
+}
+function modelTurns() {
+  const out = [];
+  let lastAssistant = -1;
+  state.turns.forEach((t, i) => { if (t.role === 'assistant' && !t.failed) lastAssistant = i; });
+  state.turns.forEach((t, i) => {
+    if (t.role === 'user') out.push({ role: 'user', content: t.content });
+    else if (!t.failed && t.text) out.push({ role: 'assistant', content: i === lastAssistant ? t.text : (t.prose || t.text) });
+  });
+  return out;
+}
+function trimForBudget(instr, turns) {
+  const size = (t) => byteLen(t.content) + 16;
+  let total = byteLen(instr) + turns.reduce((a, t) => a + size(t), 0);
+  const arr = turns.slice();
+  while (total > MAX_INPUT_BYTES && arr.length > 2) {
+    total -= size(arr.splice(1, 1)[0]);
+  }
+  return { arr, over: total > MAX_INPUT_BYTES };
+}
+
+/* ---------- model calls ---------- */
+async function askViaClaude(turns, onText, signal) {
+  const res = await sampleFn(turns, { cache: false, signal, onText, modelTier: state.depth });
+  return { text: res.text, truncated: !!res.truncated, applied: res.modelTierApplied };
+}
+
+function httpCode(status) {
+  if (status === 401 || status === 403) return 'auth';
+  if (status === 404) return 'model';
+  if (status === 429) return 'rate_limited';
+  if (status === 400) return 'invalid_request';
+  return 'upstream_error';
+}
+
+async function askViaApi(system, messages, onText, signal) {
+  let res;
+  try {
+    res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': state.api.key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify({ model: state.api.model, max_tokens: 6000, system, messages, stream: true }),
+      signal
+    });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw { code: 'cancelled', message: 'aborted' };
+    throw { code: 'network', message: String(e && e.message || e) };
+  }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const j = await res.json(); detail = (j && j.error && j.error.message) || detail; } catch (e) {}
+    throw { code: httpCode(res.status), message: detail };
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', text = '', stop = null;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buf = (buf + dec.decode(chunk.value, { stream: true })).replace(/\r\n/g, '\n');
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const payload = block.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('');
+        if (!payload) continue;
+        let evt; try { evt = JSON.parse(payload); } catch (e) { continue; }
+        if (evt.type === 'content_block_delta' && evt.delta && evt.delta.type === 'text_delta') {
+          text += evt.delta.text;
+          onText({ text: text, delta: evt.delta.text });
+        } else if (evt.type === 'message_delta' && evt.delta && evt.delta.stop_reason) {
+          stop = evt.delta.stop_reason;
+        } else if (evt.type === 'error') {
+          const t = evt.error && evt.error.type;
+          throw { code: t === 'overloaded_error' ? 'rate_limited' : 'upstream_error', message: (evt.error && evt.error.message) || 'stream error', text: text };
+        }
+      }
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw { code: 'cancelled', message: 'aborted', text: text };
+    if (e && e.code) throw e;
+    throw { code: 'upstream_error', message: String(e && e.message || e), text: text };
+  }
+  if (!text.trim()) throw { code: 'empty_completion', message: 'no text' };
+  return { text: text, truncated: stop === 'max_tokens', applied: state.api.model };
+}
+
+/* ---------- worksheet parsing ---------- */
+function looksLikeSheet(o) {
+  return o && typeof o === 'object' && !Array.isArray(o) &&
+    ('status' in o || 'tier' in o || 'tier_label' in o) &&
+    ('elevated' in o || 'summary' in o || 'drivers' in o);
+}
+function splitWorksheet(text) {
+  const re = /```([A-Za-z0-9_-]*)[ \t]*\n([\s\S]*?)```/g;
+  let m, data = null;
+  const cuts = [];
+  while ((m = re.exec(text)) !== null) {
+    const info = (m[1] || '').toLowerCase();
+    if (info !== 'aria-worksheet' && info !== 'json' && info !== '') continue;
+    let obj = null;
+    try { obj = JSON.parse(m[2]); } catch (e) { obj = null; }
+    if (looksLikeSheet(obj)) { data = obj; cuts.push([m.index, m.index + m[0].length]); }
+  }
+  let prose = text;
+  for (let i = cuts.length - 1; i >= 0; i--) prose = prose.slice(0, cuts[i][0]) + prose.slice(cuts[i][1]);
+  return { prose: prose.replace(/\n{3,}/g, '\n\n').trim(), data: data };
+}
+function streamProse(text) {
+  let cut = text.length;
+  ['```aria-worksheet', '```json'].forEach((marker) => {
+    const i = text.indexOf(marker);
+    if (i >= 0 && i < cut) cut = i;
+  });
+  return text.slice(0, cut).replace(/\n`{1,3}[A-Za-z-]*\s*$/, '');
+}
+function normalizeSheet(d) {
+  const strArr = (v, n) => Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()).slice(0, n).map((s) => clip(s, 240)) : [];
+  const tier = [1, 2, 3, 4].indexOf(Number(d.tier)) >= 0 ? Number(d.tier) : null;
+  const status = ['assessed', 'insufficient_info', 'refer_siu', 'refer_specialist'].indexOf(d.status) >= 0 ? d.status : (tier ? 'assessed' : 'insufficient_info');
+  const f = (d.flags && typeof d.flags === 'object') ? d.flags : {};
+  const w = (d.what_if && typeof d.what_if === 'object') ? d.what_if : {};
+  return {
+    line: LOB_LABELS[d.line] ? d.line : (state.lob || ''),
+    status: status,
+    tier: tier,
+    tier_label: clip(d.tier_label || (tier ? TIER_LABELS[tier] : 'Not assigned'), 60),
+    confidence: ['high', 'medium', 'low'].indexOf(d.confidence) >= 0 ? d.confidence : 'medium',
+    descriptor: clip(d.descriptor, 160),
+    summary: clip(d.summary, 420),
+    elevated: strArr(d.elevated, 8),
+    mitigating: strArr(d.mitigating, 8),
+    unknowns: strArr(d.unknowns, 8),
+    drivers: Array.isArray(d.drivers) ? d.drivers.filter((x) => x && typeof x === 'object').slice(0, 4).map((x) => ({
+      factor: clip(x.factor, 90), effect: x.effect === 'lowers' ? 'lowers' : 'raises', why: clip(x.why, 240)
+    })) : [],
+    comparables: Array.isArray(d.comparables) ? d.comparables.filter((x) => x && typeof x === 'object').slice(0, 4).map((x) => ({
+      name: clip(x.name, 60) || 'Comparable profile', profile: clip(x.profile, 220),
+      outcome: clip(x.outcome, 20), difference: clip(x.difference, 240)
+    })) : [],
+    conditions: strArr(d.conditions, 6),
+    verifications: strArr(d.verifications, 8),
+    flags: {
+      contradictions: strArr(f.contradictions, 5),
+      siu_referral: !!f.siu_referral,
+      manipulation_attempt: !!f.manipulation_attempt,
+      specialist_market: !!f.specialist_market
+    },
+    what_if: { is_what_if: !!w.is_what_if, change: clip(w.change, 160) }
+  };
+}
+
+/* ---------- PII guard ---------- */
+function luhn(num) {
+  const d = num.replace(/\D/g, '');
+  if (d.length < 13 || d.length > 19) return false;
+  let sum = 0, alt = false;
+  for (let i = d.length - 1; i >= 0; i--) {
+    let n = Number(d[i]);
+    if (alt) { n *= 2; if (n > 9) n -= 9; }
+    sum += n; alt = !alt;
+  }
+  return sum % 10 === 0;
+}
+const PII_RULES = [
+  { name: 'social insurance number', re: /\b\d{3}[-\s]\d{3}[-\s]\d{3}\b/g },
+  { name: 'social security number', re: /\b\d{3}-\d{2}-\d{4}\b/g },
+  { name: 'health card number', re: /\b\d{4}[-\s]?\d{3}[-\s]?\d{3}[-\s]?[A-Za-z]{2}\b/g },
+  { name: 'payment card number', re: /\b(?:\d[ -]?){13,19}\b/g, check: luhn }
+];
+function scanPII(text) {
+  const hits = [];
+  PII_RULES.forEach((rule) => {
+    rule.re.lastIndex = 0;
+    let m;
+    while ((m = rule.re.exec(text)) !== null) {
+      if (rule.check && !rule.check(m[0])) continue;
+      hits.push({ name: rule.name, value: m[0] });
+    }
+  });
+  return hits;
+}
+function redact(text) {
+  let out = text;
+  PII_RULES.forEach((rule) => {
+    out = out.replace(new RegExp(rule.re.source, 'g'), (match) => (rule.check && !rule.check(match)) ? match : '[REDACTED]');
+  });
+  return out;
+}
+
+/* ---------- rendering: thread ---------- */
+function introNodes() {
+  const frag = document.createDocumentFragment();
+
+  const notice = document.createElement('div');
+  notice.className = 'disclaimer-line';
+  notice.textContent = DISCLAIMER_LINE;
+  frag.appendChild(notice);
+
+  const opener = document.createElement('div');
+  opener.className = 'msg aria';
+  opener.innerHTML =
+    '<div class="msg-head"><span class="who">ARIA</span></div>' +
+    '<div class="bubble prose">' + renderMarkdown(OPENER) + '</div>';
+  frag.appendChild(opener);
+
+  return frag;
+}
+function userMsgNode(t) {
+  const node = document.createElement('div');
+  node.className = 'msg user';
+  const long = t.display.length > 780;
+  node.innerHTML =
+    '<div class="msg-head"><span class="who">Submitted</span>' +
+    (t.lob ? '<span class="chip">' + esc(LOB_LABELS[t.lob]) + '</span>' : '') +
+    '<span class="stamp-time mono">' + esc(clockOf(t.ts)) + '</span></div>' +
+    '<div class="bubble' + (long ? ' clamped' : '') + '">' + esc(t.display) + '</div>' +
+    (long ? '<button type="button" class="btn ghost sm expand">Show full submission</button>' : '');
+  if (long) {
+    const btn = node.querySelector('.expand');
+    const bubble = node.querySelector('.bubble');
+    btn.addEventListener('click', () => {
+      const clamped = bubble.classList.toggle('clamped');
+      btn.textContent = clamped ? 'Show full submission' : 'Collapse submission';
+    });
+  }
+  return node;
+}
+
+function assistantMsgNode(t) {
+  const node = document.createElement('div');
+  node.className = 'msg aria';
+  const head = '<div class="msg-head"><span class="who">ARIA</span>' +
+    (t.sheetId ? '<span class="chip">Assessment</span>' : '') +
+    '<span class="stamp-time mono">' + esc(clockOf(t.ts)) + '</span></div>';
+  node.innerHTML = head + '<div class="bubble prose">' + renderMarkdown(t.prose || t.text || '') + '</div>';
+  if (t.truncated) {
+    const n = document.createElement('div');
+    n.className = 'msg-error';
+    n.innerHTML = '<span>The reply hit the length limit. Ask ARIA to continue the section it stopped in.</span>';
+    node.appendChild(n);
+  }
+  if (t.note) {
+    const n = document.createElement('div');
+    n.className = 'msg-error';
+    n.innerHTML = '<span>' + esc(t.note) + '</span>';
+    node.appendChild(n);
+  }
+  if (t.sheetId) node.appendChild(quickActions(t.sheetId));
+  return node;
+}
+
+function quickActions(sheetId) {
+  const row = document.createElement('div');
+  row.className = 'actions-row';
+  const items = [
+    ['Run a what-if', () => fillComposer('What if ')],
+    ['Compare the tier above and below', () => fillComposer('What separates this applicant from the tier above and the tier below?')],
+    ['Draft a referral rationale', () => fillComposer('Draft a declination or referral rationale I can put in the file for this applicant.')],
+    ['Open worksheet', () => { state.activeSheet = sheetId; renderWorksheet(); setView('sheet'); }]
+  ];
+  items.forEach(([label, fn]) => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'btn sm'; b.textContent = label;
+    b.addEventListener('click', fn);
+    row.appendChild(b);
+  });
+  return row;
+}
+
+function errorNode(code, detail, retryable) {
+  const node = document.createElement('div');
+  node.className = 'msg aria';
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-error';
+  wrap.innerHTML = '<span><strong>' + esc(ERR_COPY[code] || ERR_COPY.upstream_error) + '</strong>' +
+    (detail ? '<br><span class="mono" style="font-size:11.5px;opacity:.85">' + esc(clip(detail, 200)) + '</span>' : '') + '</span>';
+  if (retryable) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'btn sm'; b.textContent = 'Retry';
+    b.addEventListener('click', () => { node.remove(); runTurn(); });
+    wrap.appendChild(b);
+  }
+  node.appendChild(wrap);
+  return node;
+}
+
+function renderThread() {
+  const box = $('threadInner');
+  box.innerHTML = '';
+  box.appendChild(introNodes());
+  state.turns.forEach((t) => {
+    box.appendChild(t.role === 'user' ? userMsgNode(t) : assistantMsgNode(t));
+  });
+  if (state.turns.length) scrollThread(true);
+  else $('thread').scrollTop = 0;
+}
+function scrollThread(force) {
+  const t = $('thread');
+  if (force || stick) t.scrollTop = t.scrollHeight;
+}
+
+/* ---------- rendering: worksheet ---------- */
+function tierColor(tier) {
+  return tier ? 'var(--t' + tier + ')' : 'var(--t0)';
+}
+function listCard(title, items, color) {
+  if (!items.length) return '';
+  return '<div class="fgroup" style="--fc:' + color + '"><div class="fhead">' + esc(title) + '</div><ul>' +
+    items.map((i) => '<li>' + esc(i) + '</li>').join('') + '</ul></div>';
+}
+function worksheetHtml(ws, meta) {
+  const color = tierColor(ws.tier);
+  const confN = { low: 1, medium: 2, high: 3 }[ws.confidence] || 2;
+
+  let html = '';
+  html += '<div class="ws-head"><div><div class="ws-title">Underwriting worksheet</div>' +
+    '<div class="ws-flagline">' + esc(ws.line ? LOB_LABELS[ws.line] : 'Line not set') +
+    (meta && meta.ts ? ' · ' + esc(clockOf(meta.ts)) : '') + '</div></div>' +
+    '<span class="chip">' + esc(STATUS_LABELS[ws.status] || 'Assessed') + '</span></div>';
+
+  html += '<div class="card" style="--tier:' + color + '">' +
+    '<div class="tier-row">' +
+    '<div class="stamp' + (ws.tier ? '' : ' pending') + '"><div class="n">' + (ws.tier ? ws.tier : 'HOLD') + '</div>' +
+    '<div class="k">' + (ws.tier ? 'Tier' : 'No tier') + '</div></div>' +
+    '<div class="tier-meta">' +
+    '<div class="tier-label">' + esc(ws.tier_label || 'Not assigned') + '</div>' +
+    (ws.descriptor ? '<div class="tier-desc">' + esc(ws.descriptor) + '</div>' : '') +
+    '<div class="conf"><span class="label">Confidence</span><span class="bars">' +
+    [1, 2, 3].map((i) => '<i class="' + (i <= confN ? 'on' : '') + '"></i>').join('') +
+    '</span><span class="mono" style="font-size:11px">' + esc(ws.confidence) + '</span></div>' +
+    '</div></div>' +
+    (ws.summary ? '<div class="summary" style="margin-top:11px">' + esc(ws.summary) + '</div>' : '') +
+    (ws.what_if && ws.what_if.is_what_if ? '<div class="ws-flagline" style="margin-top:8px">What-if: ' + esc(ws.what_if.change) + '</div>' : '') +
+    '</div>';
+
+  const flags = ws.flags || {};
+  let flagHtml = '';
+  if (flags.siu_referral) flagHtml += '<div class="flag" data-k="crit"><i>◆</i><div><b>Refer to SIU</b><span>Material misrepresentation concerns outweigh a standard underwriting decision on this file.</span></div></div>';
+  if (flags.manipulation_attempt) flagHtml += '<div class="flag" data-k="crit"><i>◆</i><div><b>Embedded instruction ignored</b><span>The submission contained text addressed to the model. It was treated as data, not as a command.</span></div></div>';
+  if (flags.specialist_market) flagHtml += '<div class="flag" data-k="warn"><i>▲</i><div><b>Specialist or surplus lines</b><span>Part of this exposure sits outside standard markets.</span></div></div>';
+  (flags.contradictions || []).forEach((c) => {
+    flagHtml += '<div class="flag" data-k="warn"><i>▲</i><div><b>Contradiction to resolve</b><span>' + esc(c) + '</span></div></div>';
+  });
+  if (flagHtml) html += '<div>' + flagHtml + '</div>';
+
+  const factors = listCard('Elevated risk', ws.elevated, 'var(--t4)') +
+    listCard('Mitigating', ws.mitigating, 'var(--t1)') +
+    listCard('Unknown or unverified', ws.unknowns, 'var(--t3)');
+  if (factors) html += '<div class="card"><div class="card-title">Risk factors</div><div class="factors">' + factors + '</div></div>';
+
+  if (ws.drivers.length) {
+    html += '<div class="card"><div class="card-title">What decided the tier</div><div class="drivers">' +
+      ws.drivers.map((d) => '<div class="driver ' + (d.effect === 'lowers' ? 'down' : 'up') + '">' +
+        '<span class="arw">' + (d.effect === 'lowers' ? '▼' : '▲') + '</span>' +
+        '<div><b>' + esc(d.factor) + '</b> <span>' + esc(d.why) + '</span></div></div>').join('') +
+      '</div></div>';
+  }
+
+  if (ws.comparables.length) {
+    html += '<div class="card"><div class="card-title">Illustrative comparables</div>' +
+      ws.comparables.map((c) => '<div class="cmp"><div class="cname">' + esc(c.name) +
+        (c.outcome ? '<span class="out" data-o="' + esc(String(c.outcome).toLowerCase()) + '">' + esc(c.outcome) + '</span>' : '') +
+        '</div><p>' + esc(c.profile) + '</p>' + (c.difference ? '<p><em>Difference:</em> ' + esc(c.difference) + '</p>' : '') + '</div>').join('') +
+      '</div>';
+  }
+
+  if (ws.conditions.length) {
+    html += '<div class="card"><div class="card-title">Terms to consider</div><div class="factors">' +
+      '<div class="fgroup" style="--fc:var(--accent)"><ul>' + ws.conditions.map((c) => '<li>' + esc(c) + '</li>').join('') + '</ul></div></div></div>';
+  }
+
+  if (ws.verifications.length) {
+    const key = meta && meta.id ? meta.id : 'example';
+    const done = state.checks[key] || [];
+    html += '<div class="card"><div class="card-title">Before binding</div><div class="checks">' +
+      ws.verifications.map((v, i) => '<label class="check' + (done[i] ? ' done' : '') + '">' +
+        '<input type="checkbox" data-sheet="' + esc(key) + '" data-i="' + i + '"' + (done[i] ? ' checked' : '') + '>' +
+        '<span>' + esc(v) + '</span></label>').join('') +
+      '</div></div>';
+  }
+
+  if (state.sheets.length) {
+    html += '<div class="card"><div class="card-title">Assessments this session</div><div class="history">' +
+      state.sheets.map((s, i) => '<button type="button" class="hitem" data-sheet="' + esc(s.id) + '" style="--tier:' + tierColor(s.data.tier) + '"' +
+        (state.activeSheet === s.id ? ' aria-current="true"' : '') + '>' +
+        '<span class="hn">' + (i + 1) + '</span>' +
+        '<span class="ht">' + esc(s.data.what_if && s.data.what_if.is_what_if ? 'What-if: ' + s.data.what_if.change : (s.data.descriptor || 'Assessment')) + '</span>' +
+        '<span class="hb">' + (s.data.tier ? 'T' + s.data.tier : STATUS_LABELS[s.data.status] || '—') + '</span>' +
+        '</button>').join('') +
+      '</div></div>';
+  }
+
+  html += '<div class="ws-actions">' +
+    '<button type="button" class="btn sm" id="btnSaveWs">Download worksheet</button>' +
+    '<button type="button" class="btn sm ghost" id="btnCopyWs">Copy</button>' +
+    '</div>';
+  html += '<div class="ws-flagline">Advisory only. Not a binding underwriting decision.</div>';
+  return html;
+}
+
+function activeSheetRecord() {
+  if (!state.sheets.length) return null;
+  const found = state.sheets.filter((s) => s.id === state.activeSheet)[0];
+  return found || state.sheets[state.sheets.length - 1];
+}
+function renderWorksheet() {
+  const rec = activeSheetRecord();
+  const box = $('ws');
+  if (!rec) {
+    box.innerHTML =
+      '<div class="ws-title">Underwriting worksheet</div>' +
+      '<div class="ws-empty">Nothing here yet.</div>';
+    return;
+  }
+  const ws = rec.data;
+  box.innerHTML = worksheetHtml(ws, rec);
+  box.querySelectorAll('.hitem').forEach((b) => b.addEventListener('click', () => {
+    state.activeSheet = b.dataset.sheet; renderWorksheet(); saveSession();
+  }));
+  box.querySelectorAll('.check input').forEach((cb) => cb.addEventListener('change', () => {
+    const k = cb.dataset.sheet, i = Number(cb.dataset.i);
+    if (!state.checks[k]) state.checks[k] = [];
+    state.checks[k][i] = cb.checked;
+    cb.closest('.check').classList.toggle('done', cb.checked);
+    saveSession();
+  }));
+  const save = $('btnSaveWs'), copy = $('btnCopyWs');
+  if (save) save.addEventListener('click', () => {
+    saveFile('aria-worksheet-' + new Date().toISOString().slice(0, 10) + '.md', worksheetMarkdown(ws));
+  });
+  if (copy) copy.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(worksheetMarkdown(ws)); toast('Worksheet copied'); }
+    catch (e) { toast('Copying is blocked here. Use Download instead.'); }
+  });
+}
+
+/* ---------- exports ---------- */
+function worksheetMarkdown(ws) {
+  const L = [];
+  const bullets = (title, items) => { if (items && items.length) { L.push('### ' + title, ''); items.forEach((i) => L.push('* ' + i)); L.push(''); } };
+  L.push('# ARIA underwriting worksheet', '');
+  L.push('* Line of business: ' + (LOB_LABELS[ws.line] || 'not set'));
+  L.push('* Status: ' + (STATUS_LABELS[ws.status] || ws.status));
+  L.push('* Suggested tier: ' + (ws.tier ? ws.tier + ' · ' + ws.tier_label : ws.tier_label || 'Not assigned'));
+  L.push('* Confidence: ' + ws.confidence);
+  if (ws.descriptor) L.push('* Risk: ' + ws.descriptor);
+  if (ws.what_if && ws.what_if.is_what_if) L.push('* What-if scenario: ' + ws.what_if.change);
+  L.push('* Generated: ' + new Date().toISOString().slice(0, 16).replace('T', ' '));
+  L.push('');
+  if (ws.summary) L.push('### Summary', '', ws.summary, '');
+  bullets('Elevated risk factors', ws.elevated);
+  bullets('Mitigating factors', ws.mitigating);
+  bullets('Unknown or unverified', ws.unknowns);
+  if (ws.drivers.length) {
+    L.push('### What decided the tier', '');
+    ws.drivers.forEach((d) => L.push('* ' + d.factor + ' (' + d.effect + ' risk): ' + d.why));
+    L.push('');
+  }
+  if (ws.comparables.length) {
+    L.push('### Illustrative comparables', '');
+    ws.comparables.forEach((c) => L.push('* ' + c.name + ' — ' + c.profile + ' Typical outcome: ' + c.outcome + '. Difference: ' + c.difference));
+    L.push('');
+  }
+  bullets('Terms to consider', ws.conditions);
+  bullets('Before binding', ws.verifications);
+  const f = ws.flags || {};
+  const fl = [];
+  if (f.siu_referral) fl.push('Refer to SIU rather than a standard decision');
+  if (f.manipulation_attempt) fl.push('Submission contained an embedded instruction, treated as data');
+  if (f.specialist_market) fl.push('Specialist or surplus lines market indicated');
+  (f.contradictions || []).forEach((c) => fl.push('Contradiction: ' + c));
+  bullets('Flags', fl);
+  L.push('---', '', 'Advisory only. Not a binding insurance decision, legal advice, or regulatory guidance. Comparables are illustrative industry benchmarks. Profiles used in this demo are synthetic.');
+  return L.join('\n');
+}
+function transcriptMarkdown() {
+  const L = ['# ARIA session transcript', '', 'Generated ' + new Date().toISOString().slice(0, 16).replace('T', ' '), '',
+    'Advisory only. Synthetic demo data. Not a binding underwriting decision.', ''];
+  state.turns.forEach((t) => {
+    if (t.role === 'user') {
+      L.push('## Submitted' + (t.lob ? ' · ' + LOB_LABELS[t.lob] : ''), '', '```', t.display, '```', '');
+    } else {
+      L.push('## ARIA', '', (t.prose || t.text || ''), '');
+    }
+  });
+  state.sheets.forEach((s, i) => { L.push('---', '', '# Worksheet ' + (i + 1), '', worksheetMarkdown(s.data), ''); });
+  return L.join('\n');
+}
+async function saveFile(filename, data) {
+  if (downloadsNs) {
+    try {
+      const r = await downloadsNs.save({ filename: filename, data: data });
+      if (r && r.status === 'saved') toast('Saved to your downloads');
+    } catch (e) {
+      if (e && e.code !== 'declined') toast('Could not save the file (' + ((e && e.code) || 'error') + ')');
+    }
+    return;
+  }
+  if (state.mode === 'claude') { toast('Downloads are not available in this view'); return; }
+  try {
+    const blob = new Blob([data], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    toast('Downloaded ' + filename);
+  } catch (e) { toast('Download blocked in this view'); }
+}
+
+/* ---------- conversation ---------- */
+function fillComposer(text) {
+  const box = $('input');
+  box.value = text;
+  box.focus();
+  box.setSelectionRange(box.value.length, box.value.length);
+  autosize();
+  setView('thread');
+}
+function setLob(lob) {
+  state.lob = lob || '';
+  document.querySelectorAll('#lobSeg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.lob === state.lob)));
+  saveSession();
+}
+
+function send() {
+  if (state.busy || state.fatal) return;
+  const box = $('input');
+  const text = box.value.trim();
+  if (!text) { box.focus(); return; }
+  if (state.mode === 'apikey' && !state.api.key) { openDrawer(); toast('Add an Anthropic API key to run ARIA here'); return; }
+  if (state.mode === 'unavailable') { toast('Claude is not available in this view. See How it works.'); return; }
+  if (byteLen(text) > 40000) { toast('That submission is too long. Trim it to about 30,000 characters.'); return; }
+
+  if (!state.guardAck) {
+    const hits = scanPII(text);
+    if (hits.length) { showGuard(hits); return; }
+  }
+  hideGuard();
+  state.guardAck = false;
+
+  state.turns.push({
+    id: uid(), role: 'user', ts: Date.now(), lob: state.lob,
+    display: text, content: wrapUser(text, state.lob)
+  });
+  box.value = ''; autosize(); saveSession(); renderThread();
+  runTurn();
+}
+
+async function runTurn() {
+  if (state.busy) return;
+  state.busy = true; updateControls();
+  if (readyP) { try { await readyP; } catch (e) {} }
+  if (state.mode === 'unavailable' || (state.mode === 'apikey' && !state.api.key)) {
+    state.busy = false; updateControls();
+    $('threadInner').appendChild(errorNode(state.mode === 'apikey' ? 'auth' : 'capability_removed', '', false));
+    scrollThread(true);
+    return;
+  }
+
+  const box = $('threadInner');
+  liveNode = document.createElement('div');
+  liveNode.className = 'msg aria';
+  liveNode.innerHTML = '<div class="msg-head"><span class="who">ARIA</span></div>' +
+    '<div class="bubble"><span class="typing" role="status">Reviewing the file<i></i><i></i><i></i></span></div>';
+  box.appendChild(liveNode);
+  scrollThread(true);
+
+  const slow = setTimeout(() => {
+    const b = liveNode && liveNode.querySelector('.bubble');
+    if (b && b.querySelector('.typing')) {
+      b.insertAdjacentHTML('beforeend', '<div class="ws-flagline" style="margin-top:8px">If a permission prompt appeared, choose Allow so this page can use Claude on your account.</div>');
+    }
+  }, 6000);
+
+  const instr = instructionTurn();
+  const budget = trimForBudget(instr, modelTurns());
+  const bubble = () => liveNode && liveNode.querySelector('.bubble');
+  let started = false;
+  const onText = ({ text }) => {
+    started = true;
+    clearTimeout(slow);
+    const b = bubble();
+    if (!b) return;
+    b.classList.add('prose');
+    b.innerHTML = renderMarkdown(streamProse(text));
+    scrollThread(false);
+  };
+
+  controller = new AbortController();
+  let out = null, err = null;
+  try {
+    if (state.mode === 'claude') {
+      out = await askViaClaude([{ role: 'user', content: instr }].concat(budget.arr), onText, controller.signal);
+    } else {
+      out = await askViaApi(instr, budget.arr, onText, controller.signal);
+    }
+  } catch (e) {
+    err = e || { code: 'upstream_error' };
+  }
+  clearTimeout(slow);
+  controller = null;
+  if (liveNode) { liveNode.remove(); liveNode = null; }
+
+  if (out) {
+    commitAssistant(out.text, out.truncated, budget.over ? 'Older turns were dropped from this request to stay inside the context limit.' : '');
+    if (out.applied && state.mode === 'claude' && out.applied !== state.depth) {
+      toast('Ran on the ' + out.applied + ' model tier');
+    }
+  } else {
+    const code = (err && err.code) || 'upstream_error';
+    const partial = err && typeof err.text === 'string' ? err.text : '';
+    if (partial && partial.trim().length > 60 && code !== 'refused') {
+      commitAssistant(partial, false, code === 'cancelled' ? 'Stopped before ARIA finished.' : 'The reply was cut off before ARIA finished.', true);
+    }
+    if (code !== 'cancelled') {
+      $('threadInner').appendChild(errorNode(code, err && err.message, !FATAL_CODES.has(code) && code !== 'refused'));
+      scrollThread(true);
+    }
+    if (FATAL_CODES.has(code)) { state.fatal = code; setStatus('off', 'Claude unavailable'); }
+  }
+
+  state.busy = false; updateControls(); saveSession();
+}
+
+function commitAssistant(text, truncated, note, failed) {
+  const parts = splitWorksheet(text);
+  const turn = {
+    id: uid(), role: 'assistant', ts: Date.now(),
+    text: text, prose: parts.prose || text, truncated: !!truncated, note: note || '', failed: !!failed
+  };
+  if (parts.data) {
+    const ws = normalizeSheet(parts.data);
+    const rec = { id: uid(), ts: turn.ts, data: ws };
+    state.sheets.push(rec);
+    state.activeSheet = rec.id;
+    turn.sheetId = rec.id;
+    if (!state.lob && ws.line) setLob(ws.line);
+  }
+  state.turns.push(turn);
+  renderThread();
+  renderWorksheet();
+  if (turn.sheetId && narrow.matches && state.view !== 'sheet') $('wsBadge').hidden = false;
+}
+
+/* ---------- guard ui ---------- */
+function showGuard(hits) {
+  const names = [];
+  hits.forEach((h) => { if (names.indexOf(h.name) === -1) names.push(h.name); });
+  const g = $('guard');
+  g.hidden = false;
+  g.className = 'guard';
+  g.innerHTML = '<div class="g-text"><strong>Possible real identifier in this message</strong><br>' +
+    'Detected: ' + esc(names.join(', ')) + '. ARIA demos are meant to run on synthetic data.</div>' +
+    '<div class="row"><button type="button" class="btn sm primary" id="gRedact">Redact and send</button>' +
+    '<button type="button" class="btn sm" id="gSend">Send as written</button>' +
+    '<button type="button" class="btn sm ghost" id="gEdit">Keep editing</button></div>';
+  $('gRedact').addEventListener('click', () => {
+    const box = $('input');
+    box.value = redact(box.value);
+    autosize(); state.guardAck = true; hideGuard(); send();
+  });
+  $('gSend').addEventListener('click', () => { state.guardAck = true; hideGuard(); send(); });
+  $('gEdit').addEventListener('click', () => { hideGuard(); $('input').focus(); });
+}
+function hideGuard() { const g = $('guard'); g.hidden = true; g.innerHTML = ''; }
+
+/* ---------- controls / layout ---------- */
+const narrow = window.matchMedia('(max-width: 1039px)');
+function applyLayout() {
+  const t = $('threadCol'), s = $('sheetCol');
+  if (narrow.matches) { t.hidden = state.view !== 'thread'; s.hidden = state.view !== 'sheet'; }
+  else { t.hidden = false; s.hidden = false; }
+  $('tabThread').setAttribute('aria-pressed', String(state.view === 'thread'));
+  $('tabSheet').setAttribute('aria-pressed', String(state.view === 'sheet'));
+}
+function setView(v) {
+  state.view = v;
+  if (v === 'sheet') $('wsBadge').hidden = true;
+  applyLayout();
+  if (v === 'thread') scrollThread(true);
+}
+function setStatus(kind, text) {
+  const s = $('status');
+  s.dataset.state = kind;
+  $('statusText').textContent = text;
+}
+function updateControls() {
+  $('btnSend').hidden = state.busy;
+  $('btnStop').hidden = !state.busy;
+  $('btnSend').disabled = !!state.fatal;
+  $('input').disabled = !!state.fatal;
+}
+function autosize() {
+  const box = $('input');
+  box.style.height = 'auto';
+  box.style.height = Math.min(box.scrollHeight + 2, Math.round(window.innerHeight * 0.38)) + 'px';
+}
+/* ---------- drawer ---------- */
+function runSettingsHtml() {
+  if (state.mode === 'apikey') {
+    return '<h3>Running this page</h3>' +
+      '<p>No Claude viewer here, so ARIA runs on your own Anthropic API key. The key stays in this browser and is sent only to api.anthropic.com.</p>' +
+      '<div class="field"><label for="apiKey">Anthropic API key</label>' +
+      '<input type="password" id="apiKey" placeholder="sk-ant-..." autocomplete="off" spellcheck="false" value="' + esc(state.api.key) + '">' +
+      '<span class="help">Create one at console.anthropic.com under API keys.</span></div>' +
+      '<div class="field"><label for="apiModel">Model</label>' +
+      '<select id="apiModel">' +
+      ['claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5-20251001'].map((m) =>
+        '<option value="' + m + '"' + (state.api.model === m ? ' selected' : '') + '>' + m + '</option>').join('') +
+      '<option value="__custom"' + (['claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5-20251001'].indexOf(state.api.model) === -1 ? ' selected' : '') + '>Other model ID</option>' +
+      '</select></div>' +
+      '<div class="field" id="customModelWrap"' + (['claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5-20251001'].indexOf(state.api.model) === -1 ? '' : ' hidden') + '>' +
+      '<label for="customModel">Model ID</label><input type="text" id="customModel" value="' + esc(state.api.model) + '"></div>' +
+      '<div class="row"><label class="check"><input type="checkbox" id="rememberKey"' + (state.api.remember ? ' checked' : '') + '><span>Remember the key on this device</span></label></div>' +
+      '<div class="row" style="margin-top:8px"><button type="button" class="btn primary sm" id="btnSaveKey">Save</button></div>';
+  }
+  if (state.mode === 'unavailable') {
+    return '<h3>Running this page</h3>' +
+      '<p>This view has no model runtime, so ARIA cannot answer here. Open the standalone build and supply an Anthropic API key instead.</p>';
+  }
+  return '<h3>Running this page</h3>' +
+    '<p>ARIA is using the model runtime provided by this host. The first message asks you to allow it, and each reply counts against that account.</p>' +
+    '<div class="field"><label for="depth">Analysis depth</label>' +
+    '<select id="depth">' +
+    '<option value="default"' + (state.depth === 'default' ? ' selected' : '') + '>Standard</option>' +
+    '<option value="complex"' + (state.depth === 'complex' ? ' selected' : '') + '>Deep (slower, for borderline files)</option>' +
+    '</select><span class="help">Deep uses the most capable tier available on your plan.</span></div>';
+}
+function renderDrawer() {
+  $('runSettings').innerHTML = runSettingsHtml();
+  $('promptDump').textContent = SYSTEM_PROMPT;
+  $('addendumDump').textContent = ADDENDUM;
+  $('drawerMode').textContent = state.mode === 'claude' ? 'Claude viewer · your account'
+    : state.mode === 'apikey' ? 'Standalone · your API key'
+    : state.mode === 'unavailable' ? 'Claude unavailable in this view' : 'Starting up';
+
+  const depth = $('depth');
+  if (depth) depth.addEventListener('change', () => { state.depth = depth.value; saveSettings(); });
+
+  const sel = $('apiModel');
+  if (sel) {
+    sel.addEventListener('change', () => {
+      const custom = sel.value === '__custom';
+      $('customModelWrap').hidden = !custom;
+      if (!custom) { state.api.model = sel.value; saveSettings(); }
+    });
+  }
+  const saveKey = $('btnSaveKey');
+  if (saveKey) {
+    saveKey.addEventListener('click', () => {
+      const remember = $('rememberKey').checked;
+      state.api.remember = remember;
+      const custom = $('apiModel').value === '__custom';
+      const model = custom ? $('customModel').value.trim() : $('apiModel').value;
+      if (model) state.api.model = model;
+      storeKey($('apiKey').value.trim());
+      saveSettings();
+      setStatus(state.api.key ? 'ok' : 'off', state.api.key ? 'API key · ' + state.api.model : 'API key needed');
+      toast(state.api.key ? 'Key saved in this browser' : 'Key cleared');
+      closeDrawer();
+    });
+  }
+}
+function openDrawer() { renderDrawer(); $('drawerRoot').hidden = false; $('btnCloseDrawer').focus(); }
+function closeDrawer() { $('drawerRoot').hidden = true; }
+
+/* ---------- runtime detection ---------- */
+async function detectRuntime() {
+  if (window.claude && typeof window.claude.use === 'function') {
+    setStatus('wait', 'Connecting to Claude');
+    let s = null;
+    try { s = await window.claude.use('sample'); } catch (e) { s = null; }
+    if (s) {
+      sampleFn = s; state.mode = 'claude';
+      setStatus('ok', 'Claude · your account');
+    } else {
+      state.mode = 'unavailable';
+      setStatus('off', 'Claude unavailable here');
+    }
+    try { downloadsNs = await window.claude.use('downloads'); } catch (e) { downloadsNs = null; }
+  } else {
+    state.mode = 'apikey';
+    setStatus(state.api.key ? 'ok' : 'off', state.api.key ? 'API key · ' + state.api.model : 'API key needed');
+  }
+  updateControls();
+  renderWorksheet();
+}
+
+/* ---------- wiring ---------- */
+function wire() {
+  document.querySelectorAll('#lobSeg button').forEach((b) => {
+    b.addEventListener('click', () => setLob(b.dataset.lob));
+  });
+  $('btnSend').addEventListener('click', send);
+  $('btnStop').addEventListener('click', () => { if (controller) controller.abort(); });
+  $('btnClear').addEventListener('click', () => { $('input').value = ''; autosize(); hideGuard(); $('input').focus(); });
+  $('input').addEventListener('input', autosize);
+  $('input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  $('thread').addEventListener('scroll', () => {
+    const t = $('thread');
+    stick = t.scrollHeight - t.scrollTop - t.clientHeight < 80;
+  });
+
+  $('tabThread').addEventListener('click', () => setView('thread'));
+  $('tabSheet').addEventListener('click', () => setView('sheet'));
+  narrow.addEventListener('change', applyLayout);
+
+  $('btnAbout').addEventListener('click', openDrawer);
+  $('btnCloseDrawer').addEventListener('click', closeDrawer);
+  $('scrim').addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeDrawer(); } });
+  $('btnExportChat').addEventListener('click', () => {
+    if (!state.turns.length) { toast('Nothing to export yet'); return; }
+    saveFile('aria-transcript-' + new Date().toISOString().slice(0, 10) + '.md', transcriptMarkdown());
+  });
+  $('btnWipe').addEventListener('click', () => { resetSession(); closeDrawer(); });
+
+  let armed = false, armTimer = null;
+  $('btnNew').addEventListener('click', () => {
+    if (!state.turns.length) { resetSession(); return; }
+    if (!armed) {
+      armed = true;
+      $('btnNew').textContent = 'Clear this session?';
+      $('btnNew').classList.add('danger');
+      armTimer = setTimeout(() => { armed = false; $('btnNew').textContent = 'New session'; $('btnNew').classList.remove('danger'); }, 4000);
+      return;
+    }
+    clearTimeout(armTimer); armed = false;
+    $('btnNew').textContent = 'New session'; $('btnNew').classList.remove('danger');
+    resetSession();
+  });
+}
+function resetSession() {
+  if (controller) controller.abort();
+  state.turns = []; state.sheets = []; state.activeSheet = null; state.checks = {}; state.guardAck = false;
+  try { localStorage.removeItem(LS_SESSION); } catch (e) {}
+  saveSession(); renderThread(); renderWorksheet(); setView('thread');
+  toast('New session started');
+}
+
+/* ---------- boot ---------- */
+function start() {
+  loadSettings();
+  loadSession();
+  wire();
+  setLob(state.lob);
+  renderThread();
+  renderWorksheet();
+  applyLayout();
+  autosize();
+  updateControls();
+  readyP = detectRuntime();
+}
+start();
+</script>
+

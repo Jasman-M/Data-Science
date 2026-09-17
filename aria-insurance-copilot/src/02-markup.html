@@ -1,0 +1,123 @@
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark">ARIA<span class="dot">.</span></span>
+      <span class="sub">Insurance Copilot</span>
+    </div>
+
+    <div class="seg" role="group" aria-label="Line of business" id="lobSeg">
+      <button type="button" data-lob="life_health" aria-pressed="true"><span class="lg">Life &amp; Health</span><span class="sm-only">Life</span></button>
+      <button type="button" data-lob="home_property" aria-pressed="false"><span class="lg">Home &amp; Property</span><span class="sm-only">Home</span></button>
+      <button type="button" data-lob="commercial_business" aria-pressed="false"><span class="lg">Commercial</span><span class="sm-only">Business</span></button>
+    </div>
+
+    <div class="bar-actions">
+      <span class="status" id="status" data-state="wait" title="Connection to Claude">
+        <span class="led"></span><span id="statusText">Connecting</span>
+      </span>
+      <button type="button" class="btn ghost sm" id="btnNew">New session</button>
+      <button type="button" class="btn ghost sm" id="btnAbout">How it works</button>
+    </div>
+  </header>
+
+  <main class="desk">
+    <section class="thread-col" id="threadCol">
+      <div class="thread" id="thread">
+        <div class="thread-inner" id="threadInner"></div>
+      </div>
+
+      <div class="composer">
+        <div class="composer-inner">
+          <div id="guard" hidden></div>
+          <label class="sr" for="input">Message to ARIA</label>
+          <textarea id="input" placeholder="Paste an applicant profile, or describe the risk you are assessing..." spellcheck="false"></textarea>
+          <div class="composer-bar">
+            <button type="button" class="btn sm ghost" id="btnClear">Clear</button>
+            <button type="button" class="btn primary" id="btnSend">Send to ARIA</button>
+            <button type="button" class="btn danger" id="btnStop" hidden>Stop</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="sheet-col" id="sheetCol" aria-label="Underwriting worksheet">
+      <div class="ws" id="ws"></div>
+    </aside>
+  </main>
+
+  <nav class="tabs" role="group" aria-label="Switch view">
+    <button type="button" id="tabThread" aria-pressed="true">Interview</button>
+    <button type="button" id="tabSheet" aria-pressed="false">Worksheet <span class="badge" id="wsBadge" hidden></span></button>
+  </nav>
+</div>
+
+<div id="drawerRoot" hidden>
+  <div class="scrim" id="scrim"></div>
+  <aside class="drawer" role="dialog" aria-modal="true" aria-label="How ARIA works">
+    <div class="drawer-head">
+      <div>
+        <div class="ws-title">How ARIA works</div>
+        <div class="ws-flagline" id="drawerMode">&nbsp;</div>
+      </div>
+      <button type="button" class="btn ghost sm" id="btnCloseDrawer">Close</button>
+    </div>
+    <div class="drawer-body">
+      <section id="runSettings"></section>
+
+      <section>
+        <h3>The assessment flow</h3>
+        <p>ARIA follows a fixed eight-step underwriting conversation rather than free-form chat.</p>
+        <ul>
+          <li>Identify the line of business, then intake the applicant profile</li>
+          <li>Probe vague or contradictory fields before scoring anything</li>
+          <li>Sort risk factors into elevated, mitigating, and unverified</li>
+          <li>Surface illustrative industry comparables and their usual outcomes</li>
+          <li>Recommend a tier, explain the two or three factors that drove it, and invite a what-if</li>
+        </ul>
+      </section>
+
+      <section>
+        <h3>Guardrails in the prompt</h3>
+        <ul>
+          <li>Pasted profiles are treated as data, so instructions hidden inside a submission are ignored and flagged</li>
+          <li>Fraud detection criteria are never enumerated, only applied</li>
+          <li>Repeated what-ifs that walk one variable toward a tier boundary are declined</li>
+          <li>Applicant identifiers are not echoed back, and no tier is ever a binding decision</li>
+        </ul>
+      </section>
+
+      <section>
+        <h3>Guardrails in this app</h3>
+        <ul>
+          <li>Messages are scanned for identifier patterns (SIN, SSN, health card, card numbers) before they leave the browser</li>
+          <li>The disclaimer and demo notice are shown on every new session</li>
+          <li>The worksheet is built from a structured block ARIA emits, so the panel can never claim a tier the prose did not</li>
+          <li>Nothing is stored on a server by this page; the session lives in this browser only</li>
+        </ul>
+      </section>
+
+      <section>
+        <h3>Prompt</h3>
+        <details class="fold" id="foldPrompt">
+          <summary>System prompt (verbatim)</summary>
+          <pre id="promptDump"></pre>
+        </details>
+        <div style="height:8px"></div>
+        <details class="fold">
+          <summary>App integration notes (added by this interface)</summary>
+          <pre id="addendumDump"></pre>
+        </details>
+      </section>
+
+      <section>
+        <h3>Session</h3>
+        <div class="row">
+          <button type="button" class="btn sm" id="btnExportChat">Export transcript</button>
+          <button type="button" class="btn sm danger" id="btnWipe">Clear saved session</button>
+        </div>
+      </section>
+    </div>
+  </aside>
+</div>
+
+<div id="toastRoot"></div>
